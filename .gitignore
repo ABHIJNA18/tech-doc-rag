@@ -1,0 +1,13 @@
+#env files
+.venv/
+.env
+
+# cache
+__pycache__/
+
+#raw data 
+data/
+*.pyc
+
+#script which contains llm txt links
+scripts/llms.txt
