@@ -1,2 +1,3 @@
 httpx
 markdown-it-py
+tiktoken
