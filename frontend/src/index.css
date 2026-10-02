@@ -1,0 +1,8 @@
+/* Global styles: Tailwind CSS (utility classes used in the components). */
+@import "tailwindcss";
+
+/* Tailwind sizes (text, spacing) are relative to this base size:
+   18px instead of the browser's 16px makes the whole UI bigger. */
+html {
+  font-size: 18px;
+}
