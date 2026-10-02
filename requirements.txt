@@ -1,3 +1,9 @@
 httpx
 markdown-it-py
 tiktoken
+python-dotenv
+langchain-core==1.6.6
+langchain-classic==1.0.8
+langchain-openai==1.6.7
+langchain-chroma==1.1.0
+chromadb==1.5.9
