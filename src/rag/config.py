@@ -59,3 +59,28 @@ RETRIEVAL_MODE = os.environ.get("RAG_RETRIEVAL_MODE", "vector")
 
 # How many chunks to retrieve per question.
 TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
+
+
+# ---------------------------------------------------------
+# Generation
+# ---------------------------------------------------------
+
+LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "gpt-5.4-mini")
+LLM_TEMPERATURE = float(os.environ.get("RAG_LLM_TEMPERATURE", "0"))
+
+# Versioned prompts live in the repository (configs/prompts.yaml).
+PROMPTS_FILE = _path("RAG_PROMPTS_FILE", REPO_DIR / "configs" / "prompts.yaml")
+PROMPT_VERSION = os.environ.get("RAG_PROMPT_VERSION", "v1")
+
+
+# ---------------------------------------------------------
+# API
+# ---------------------------------------------------------
+
+# Browser origins allowed to call the API (comma separated), e.g. the
+# local React dev server and later the Vercel domain.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("RAG_CORS_ORIGINS", "http://localhost:5180").split(",")
+    if origin.strip()
+]
