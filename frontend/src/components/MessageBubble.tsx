@@ -64,6 +64,13 @@ export default function MessageBubble({ message }: Props) {
             </div>
           </div>
         )}
+
+        {message.meta && (
+          <p className="mt-3 text-xs text-slate-400">
+            {message.meta.retrievalMode} search · {message.meta.llmModel} · prompt {message.meta.promptVersion} ·{' '}
+            {message.meta.latencySeconds.toFixed(1)}s
+          </p>
+        )}
       </div>
     </div>
   )

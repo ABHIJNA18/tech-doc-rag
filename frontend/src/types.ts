@@ -16,9 +16,30 @@ export interface Citation {
   text: string // the exact chunk text the answer drew from
 }
 
+// One retrieved chunk (cited or not), for debugging.
+export interface RetrievedChunkSummary {
+  rank: number
+  score: number // similarity, higher = more relevant
+  chunk_id: string
+  source_url: string
+  header: string
+}
+
+// Settings that produced the answer.
+export interface AnswerMeta {
+  retrievalMode: string
+  topK: number
+  llmModel: string
+  promptVersion: string
+  latencySeconds: number
+  traceId: string | null
+}
+
 export interface AskResponse {
   answer: string // answer text with [n] citation markers
   citations: Citation[]
+  retrieved?: RetrievedChunkSummary[]
+  meta?: AnswerMeta
   placeholder?: boolean // true while the backend is not connected
 }
 
@@ -28,6 +49,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   text: string
   citations?: Citation[]
+  meta?: AnswerMeta
   placeholder?: boolean
   error?: boolean
 }

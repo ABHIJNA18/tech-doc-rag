@@ -34,6 +34,7 @@ export default function App() {
           role: 'assistant',
           text: response.answer,
           citations: response.citations,
+          meta: response.meta,
           placeholder: response.placeholder,
         },
       ])
