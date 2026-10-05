@@ -47,3 +47,15 @@ EMBEDDING_CACHE_DIR = _path("RAG_EMBEDDING_CACHE_DIR", DATA_DIR / "embedding_cac
 
 COLLECTION_NAME = os.environ.get("RAG_COLLECTION_NAME", "ionos_docs")
 EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "text-embedding-3-small")
+
+
+# ---------------------------------------------------------
+# Retrieval
+# ---------------------------------------------------------
+
+# Which retrieval method to use by default ("vector" for now; phase 2
+# adds e.g. "bm25", "hybrid", "hybrid_rerank"). See rag/retrieval.py.
+RETRIEVAL_MODE = os.environ.get("RAG_RETRIEVAL_MODE", "vector")
+
+# How many chunks to retrieve per question.
+TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
