@@ -1,7 +1,33 @@
+# ---------------------------------------------------------
+# preprocess_docs.py
+#
+# Converts the raw IONOS documentation Markdown files into
+# structured sections, one record per heading section.
+#
+# Input:  ~/Projects/ionos-docs/raw/**/*.md   (downloaded pages)
+# Output: ~/Projects/ionos-docs/processed/sections.jsonl
+#
+# Steps:
+#   1. Clean GitBook syntax (navigation boilerplate, tabs, hints,
+#      content-refs, steppers, space.vars.* variables).
+#   2. Parse the Markdown with markdown-it-py.
+#   3. Split the page into sections at headings, keeping the
+#      heading path, source URL and a stable section ID, plus a
+#      breadcrumb of parent page titles from llms.txt (so pages
+#      titled "FAQ" or "Models" still say which product they cover).
+#   4. Keep paragraphs, lists, tables and code blocks as readable
+#      text. Embedded OpenAPI specs (API reference pages) are
+#      converted into readable Markdown instead of raw JSON.
+#
+# Usage:
+#   python scripts/preprocess_docs.py
+# ---------------------------------------------------------
+
 from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +41,10 @@ RAW_DIR = Path.home() / "Projects" / "ionos-docs" / "raw"
 PROCESSED_DIR = Path.home() / "Projects" / "ionos-docs" / "processed"
 
 OUTPUT_FILE = PROCESSED_DIR / "sections.jsonl"
+
+# Documentation index downloaded by download_raw_docs.py. Used for
+# page titles of parent pages (breadcrumbs).
+LLMS_INDEX = Path(__file__).resolve().parent / "llms.txt"
 
 
 # ---------------------------------------------------------
@@ -158,6 +188,16 @@ def clean_gitbook_markdown(text: str) -> str:
     # IONOS CLOUD
     # -----------------------------------------------------
 
+    # The raw Markdown often escapes underscores in variable names
+    # (space.vars.ionos\_cloud\_ai\_model\_hub). Unescape them first,
+    # otherwise the short "space.vars.ionos" rule below matches and
+    # leaves "_cloud_ai_model_hub" behind.
+    text = re.sub(
+        r"space\.vars\.[A-Za-z0-9\\_]+",
+        lambda m: m.group(0).replace("\\_", "_"),
+        text,
+    )
+
     text = re.sub(
         r'<code\s+class="expression">\s*' r"space\.vars\.ionos\\?_cloud" r"\s*</code>",
         "IONOS CLOUD",
@@ -225,6 +265,8 @@ def clean_gitbook_markdown(text: str) -> str:
 # Markdown utilities
 # ---------------------------------------------------------
 
+BREAK_TAG_RE = re.compile(r"<br\s*/?>|</(?:p|li)>", re.IGNORECASE)
+
 
 def inline_text(token) -> str:
     """
@@ -257,7 +299,9 @@ def inline_text(token) -> str:
         elif child.type == "html_inline":
             # GitBook HTML wrappers such as <code>...</code>.
             # Keep the visible text but remove the HTML tags.
-            html = child.content
+            # Line-break tags (<br>, </p>, </li>) separate text,
+            # so they become a space instead of nothing.
+            html = BREAK_TAG_RE.sub(" ", child.content)
 
             visible = re.sub(r"<[^>]+>", "", html)
             parts.append(visible)
@@ -371,6 +415,532 @@ def table_to_markdown(tokens: list, start_index: int) -> tuple[str, int]:
     return "\n".join(lines), i
 
 # ---------------------------------------------------------
+# OpenAPI specs
+#
+# API reference pages embed their OpenAPI spec as one large JSON
+# code block, which GitBook renders as the endpoint or model page.
+# We convert that JSON into readable Markdown with the same facts
+# (method, path, servers, parameters, responses, fields) instead
+# of keeping raw JSON. Nothing is generated or summarised: every
+# line comes from a field in the spec.
+#
+# - Endpoint pages: method + path, servers, authentication,
+#   parameters, request body fields and responses. The request body
+#   is expanded to its full depth, like GitBook's Body section.
+# - Models pages ("The X object"): only schema X. Each block also
+#   contains every schema X references, which have their own
+#   sections, so referenced objects are named, not repeated.
+# ---------------------------------------------------------
+
+HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
+
+# Safety limit for nested fields. Real specs nest at most 5 levels;
+# objects that refer to themselves are stopped separately.
+MAX_FIELD_DEPTH = 10
+
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+
+MARKDOWN_HEADING_RE = re.compile(r"^\s*#+\s+(.*?)\s*$")
+
+# Bold written as __Note__ (not identifiers such as __init__.py).
+MARKDOWN_UNDERSCORE_BOLD_RE = re.compile(r"(?<![\w.])__(\w[^_\n]*?)__(?![\w.])")
+
+
+def parse_openapi(code: str) -> dict[str, Any] | None:
+    code = code.strip()
+
+    if not code.startswith("{") or '"openapi"' not in code[:100]:
+        return None
+
+    try:
+        spec = json.loads(code)
+    except json.JSONDecodeError:
+        return None
+
+    return spec if isinstance(spec, dict) and "openapi" in spec else None
+
+
+def plain_text(text: str) -> str:
+    """
+    Markdown inside spec descriptions, reduced the same way
+    inline_text() reduces page text: links keep their text,
+    emphasis and code markers are dropped.
+    """
+
+    text = MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = text.replace("**", "").replace("`", "")
+    text = MARKDOWN_UNDERSCORE_BOLD_RE.sub(r"\1", text)
+
+    # "### Bad Request" -> "Bad Request." so it reads as a lead-in
+    # sentence when description lines are joined.
+    lines = []
+    for line in text.splitlines():
+        match = MARKDOWN_HEADING_RE.match(line)
+        if match:
+            line = match.group(1)
+            if line and line[-1] not in ".:!?":
+                line += "."
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def spec_description(text: str | None) -> str:
+    """
+    Full description as Markdown paragraphs. Prose lines are joined,
+    tables inside the description are kept as tables.
+    """
+
+    blocks: list[str] = []
+    prose: list[str] = []
+    table: list[str] = []
+
+    def flush():
+        if prose:
+            blocks.append(" ".join(prose))
+            prose.clear()
+        if table:
+            blocks.append("\n".join(table))
+            table.clear()
+
+    for line in plain_text(text or "").splitlines():
+
+        # Blockquote markers (> Note ...) carry no content.
+        line = re.sub(r"^\s*>\s?", "", line).strip()
+
+        if not line:
+            flush()
+        elif line.startswith("|"):
+            if prose:
+                flush()
+            table.append(line)
+        else:
+            if table:
+                flush()
+            prose.append(line)
+
+    flush()
+
+    return "\n\n".join(re.sub(r"[ \t]+", " ", block) for block in blocks)
+
+
+def short_description(text: str | None) -> str:
+    """
+    One-line description for a list item. Stops before any table,
+    because a table cannot live inside a list line.
+    """
+
+    lines = []
+
+    for line in plain_text(text or "").splitlines():
+        if line.lstrip().startswith("|"):
+            break
+        lines.append(re.sub(r"^\s*>\s?", "", line))
+
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def value_table(text: str | None) -> list[tuple[str, str]]:
+    """
+    (value, meaning) pairs from a table inside a description, e.g.
+    the eviction policy table: ("allkeys-lru", "The least recently
+    used keys will be removed first.").
+    """
+
+    rows = [line.strip() for line in plain_text(text or "").splitlines() if line.strip().startswith("|")]
+
+    pairs = []
+
+    # rows[0] is the header row, rows[1] the "| --- |" separator.
+    for row in rows[2:]:
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+
+        if len(cells) >= 2 and cells[0]:
+            pairs.append((cells[0], re.sub(r"\s+", " ", cells[1])))
+
+    return pairs
+
+
+def resolve(spec: dict, node: Any) -> tuple[str | None, dict]:
+    """
+    Follow "$ref": "#/components/schemas/Name" references.
+    Returns the referenced name (if any) and the target node.
+    """
+
+    name = None
+
+    for _ in range(10):
+        if not isinstance(node, dict) or "$ref" not in node:
+            break
+
+        ref = node["$ref"]
+        name = ref.rsplit("/", 1)[-1]
+
+        target: Any = spec
+        for part in ref.lstrip("#/").split("/"):
+            target = target.get(part, {}) if isinstance(target, dict) else {}
+
+        node = target
+
+    return name, node if isinstance(node, dict) else {}
+
+
+def is_object(schema: dict) -> bool:
+    # "additionalProperties" alone describes a free-form object.
+    return schema.get("type") == "object" or any(
+        key in schema for key in ("properties", "allOf", "additionalProperties")
+    )
+
+
+def type_label(spec: dict, schema: dict) -> str:
+    name, target = resolve(spec, schema)
+
+    if name and is_object(target):
+        return f"{name} object"
+
+    options = target.get("oneOf") or target.get("anyOf")
+    if options:
+        return " or ".join(type_label(spec, option) for option in options)
+
+    schema_type = target.get("type")
+
+    if schema_type == "array":
+        return f"array of {type_label(spec, target.get('items', {}))}"
+
+    if isinstance(schema_type, list):
+        schema_type = " or ".join(schema_type)
+
+    label = schema_type or ("object" if is_object(target) else "any")
+
+    if target.get("format"):
+        label += f", {target['format']}"
+
+    return label
+
+
+def value_text(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def constraint_facts(schema: dict) -> list[str]:
+    """
+    Limits and allowed values, each as an explicit "label: value"
+    (the same labels GitBook shows: default, min, max, ...).
+    """
+
+    facts = []
+
+    if "enum" in schema:
+        facts.append("possible values: " + ", ".join(value_text(v) for v in schema["enum"]))
+
+    for key, label in (
+        ("default", "default"),
+        ("minimum", "min"),
+        ("maximum", "max"),
+        ("minLength", "min length"),
+        ("maxLength", "max length"),
+        ("minItems", "min items"),
+        ("maxItems", "max items"),
+        ("pattern", "pattern"),
+    ):
+        if key in schema:
+            facts.append(f"{label}: {value_text(schema[key])}")
+
+    for flag, label in (
+        ("readOnly", "read-only"),
+        ("writeOnly", "write-only"),
+        ("nullable", "nullable"),
+        ("deprecated", "deprecated"),
+    ):
+        if schema.get(flag):
+            facts.append(label)
+
+    return facts
+
+
+def object_fields(spec: dict, schema: dict) -> tuple[dict, set]:
+    """
+    Properties and required names of an object, merging allOf parts.
+    """
+
+    properties: dict = {}
+    required: set = set()
+
+    for part in schema.get("allOf", []):
+        _, part = resolve(spec, part)
+        part_properties, part_required = object_fields(spec, part)
+        properties.update(part_properties)
+        required |= part_required
+
+    properties.update(schema.get("properties", {}))
+    required |= set(schema.get("required", []))
+
+    return properties, required
+
+
+def field_lines(
+    spec: dict,
+    schema: dict,
+    request_body: bool,
+    depth: int = 0,
+    seen: frozenset = frozenset(),
+) -> list[str]:
+    """
+    One list item per field, with nested objects as indented items.
+
+    Models pages (request_body=False): only inline objects are
+    expanded; referenced objects are named, because they have their
+    own section.
+
+    Request bodies (request_body=True), like GitBook's Body section:
+      - all nested objects are expanded, to full depth
+      - read-only fields are listed and labelled "read-only" (the
+        server sets them), but read-only objects are not expanded
+      - tables of allowed values in a description become nested
+        items ("allkeys-lru: The least recently used keys ...")
+    """
+
+    properties, required = object_fields(spec, schema)
+
+    lines = []
+
+    for name, prop in properties.items():
+
+        ref_name, target = resolve(spec, prop)
+
+        # Keys next to a $ref (e.g. readOnly, description) apply too.
+        merged = {**target, **{k: v for k, v in prop.items() if k != "$ref"}}
+
+        read_only = bool(merged.get("readOnly"))
+
+        facts = [type_label(spec, prop)]
+        facts.append("required" if name in required else "optional")
+        facts += constraint_facts(merged)
+
+        # Facts are separated by ";" because a list of possible
+        # values already uses commas.
+        line = "  " * depth + f"- {name} ({'; '.join(facts)})"
+
+        description = short_description(merged.get("description"))
+        if description:
+            line += f": {description}"
+
+        lines.append(line)
+
+        if request_body:
+            for value, meaning in value_table(merged.get("description")):
+                lines.append("  " * (depth + 1) + f"- {value}: {meaning}")
+
+        nested_name, nested = ref_name, target
+        if target.get("type") == "array":
+            nested_name, nested = resolve(spec, target.get("items", {}))
+
+        # "seen" holds the named objects already open on this branch,
+        # so an object that refers to itself is not expanded forever.
+        if (
+            is_object(nested)
+            and depth + 1 < MAX_FIELD_DEPTH
+            and (request_body or nested_name is None)
+            and not (request_body and read_only)
+            and nested_name not in seen
+        ):
+            lines += field_lines(
+                spec,
+                nested,
+                request_body,
+                depth + 1,
+                seen | {nested_name} if nested_name else seen,
+            )
+
+    return lines
+
+
+def api_line(spec: dict) -> str:
+    info = spec.get("info", {})
+    title = info.get("title", "API")
+    version = info.get("version")
+
+    return f"API: {title}" + (f" (version {version})" if version else "")
+
+
+def auth_text(spec: dict, operation: dict) -> str:
+    schemes = spec.get("components", {}).get("securitySchemes", {})
+    requirements = operation.get("security", spec.get("security", []))
+
+    parts = []
+
+    for requirement in requirements:
+        for name in requirement:
+            scheme = schemes.get(name, {})
+            kind = scheme.get("type")
+
+            if kind == "http" and scheme.get("scheme") == "bearer":
+                text = "Bearer token in the Authorization header"
+                if scheme.get("bearerFormat"):
+                    text += f" ({scheme['bearerFormat']})"
+            elif kind == "http":
+                text = f"HTTP {scheme.get('scheme', '')} authentication".replace("  ", " ")
+            elif kind == "apiKey":
+                text = f"API key in the {scheme.get('name')} {scheme.get('in')}"
+            else:
+                text = name
+
+            description = short_description(scheme.get("description"))
+            parts.append(f"{text}. {description}" if description else f"{text}.")
+
+    return "Authentication: " + " ".join(parts) if parts else ""
+
+
+def parameter_line(spec: dict, parameter: dict) -> str:
+    schema = parameter.get("schema", {})
+    _, target = resolve(spec, schema)
+
+    facts = [type_label(spec, schema)]
+    facts.append("required" if parameter.get("required") else "optional")
+    facts += constraint_facts({**target, **{k: v for k, v in schema.items() if k != "$ref"}})
+
+    line = f"- {parameter.get('name')} ({'; '.join(facts)})"
+
+    description = short_description(parameter.get("description") or target.get("description"))
+
+    return f"{line}: {description}" if description else line
+
+
+def media_schema(content: dict) -> dict | None:
+    if not content:
+        return None
+
+    media = content.get("application/json") or next(iter(content.values()))
+
+    return media.get("schema")
+
+
+def openapi_endpoint_markdown(spec: dict) -> str:
+    parts = [api_line(spec)]
+
+    for path, path_item in spec.get("paths", {}).items():
+        for method, operation in path_item.items():
+
+            if method not in HTTP_METHODS:
+                continue
+
+            parts.append(f"{method.upper()} {path}")
+
+            servers = operation.get("servers") or spec.get("servers", [])
+            if servers:
+                parts.append("Servers:")
+                parts.append(
+                    "\n".join(
+                        f"- {server['url']}"
+                        + (f" ({short_description(server['description'])})" if server.get("description") else "")
+                        for server in servers
+                    )
+                )
+
+            auth = auth_text(spec, operation)
+            if auth:
+                parts.append(auth)
+
+            # Parameters, grouped by location (path, query, header).
+            parameters = [
+                resolve(spec, parameter)[1]
+                for parameter in path_item.get("parameters", []) + operation.get("parameters", [])
+            ]
+
+            for location in ("path", "query", "header", "cookie"):
+                lines = [parameter_line(spec, p) for p in parameters if p.get("in") == location]
+                if lines:
+                    parts.append(f"{location.capitalize()} parameters:")
+                    parts.append("\n".join(lines))
+
+            # Request body, with its fields expanded.
+            _, body = resolve(spec, operation.get("requestBody"))
+            body_schema = media_schema(body.get("content", {}))
+
+            if body_schema is not None:
+                _, body_target = resolve(spec, body_schema)
+
+                text = f"Request body ({type_label(spec, body_schema)}"
+                text += ", required)" if body.get("required") else ")"
+
+                # The description often sits on the body's object
+                # rather than on the request body itself.
+                description = short_description(body.get("description") or body_target.get("description"))
+                parts.append(f"{text}: {description}" if description else text)
+
+                lines = field_lines(spec, body_target, request_body=True)
+                if lines:
+                    parts.append("Request body fields:")
+                    parts.append("\n".join(lines))
+
+            # Responses: status code, description and body type.
+            lines = []
+            for code, response in operation.get("responses", {}).items():
+                _, response = resolve(spec, response)
+                line = f"- {code}: {short_description(response.get('description')) or 'No description.'}"
+
+                if line[-1] not in ".:!?":
+                    line += "."
+
+                response_schema = media_schema(response.get("content", {}))
+                if response_schema is not None:
+                    line += f" Returns: {type_label(spec, response_schema)}."
+
+                lines.append(line)
+
+            if lines:
+                parts.append("Responses:")
+                parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
+def openapi_model_markdown(spec: dict, heading: str) -> str | None:
+    schemas = spec.get("components", {}).get("schemas", {})
+
+    if not schemas:
+        return None
+
+    # Models page headings look like "The ReplicaSet object".
+    match = re.fullmatch(r"The (.+) object", heading or "")
+    name = match.group(1) if match and match.group(1) in schemas else next(iter(schemas))
+    schema = schemas[name]
+
+    parts = [api_line(spec)]
+
+    description = spec_description(schema.get("description"))
+    if description:
+        parts.append(description)
+
+    if is_object(schema):
+        lines = field_lines(spec, schema, request_body=False)
+        if lines:
+            parts.append("Fields:")
+            parts.append("\n".join(lines))
+    else:
+        # A simple value (string, integer, enum): one fact per line,
+        # e.g. "Type: string (enum)", "Default: allkeys-lru".
+        lines = [f"Type: {type_label(spec, schema)}" + (" (enum)" if "enum" in schema else "")]
+        lines += [fact[0].upper() + fact[1:] for fact in constraint_facts(schema)]
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
+def openapi_to_markdown(spec: dict, heading: str) -> str | None:
+    has_operations = any(
+        method in HTTP_METHODS
+        for path_item in spec.get("paths", {}).values()
+        for method in path_item
+    )
+
+    if has_operations:
+        return openapi_endpoint_markdown(spec)
+
+    return openapi_model_markdown(spec, heading)
+
+
+# ---------------------------------------------------------
 # Add Source URL
 # ---------------------------------------------------------
 
@@ -379,6 +949,54 @@ def source_url(source_path: Path) -> str:
     relative_path = relative_path.with_suffix("")
 
     return f"https://docs.ionos.com/cloud/{relative_path.as_posix()}"
+
+
+# ---------------------------------------------------------
+# Breadcrumb
+#
+# Many pages have generic titles ("FAQ", "Overview", "Error Codes",
+# "Models") that do not say which product they belong to. The
+# breadcrumb is the list of titles of the page's parent pages, taken
+# from the documentation index, e.g.
+#   .../ai/ai-model-hub/error-codes  ->  ["AI Model Hub"]
+# ---------------------------------------------------------
+
+LLMS_LINK_RE = re.compile(r"\[([^\]]+)\]\((https://docs\.ionos\.com/cloud/[^)\s]+?)\.md\)")
+
+
+def load_page_titles(index_path: Path) -> dict[str, str]:
+    """
+    {page URL (without .md): page title} from llms.txt.
+    """
+
+    if not index_path.exists():
+        return {}
+
+    titles: dict[str, str] = {}
+
+    for match in LLMS_LINK_RE.finditer(index_path.read_text(encoding="utf-8")):
+        titles.setdefault(match.group(2), match.group(1))
+
+    return titles
+
+
+def breadcrumb(page_url: str, titles: dict[str, str]) -> list[str]:
+    """
+    Titles of the parent pages of page_url, outermost first. Parent
+    paths that are not pages themselves (e.g. /cloud/ai) are skipped.
+    """
+
+    base, _, path = page_url.partition("/cloud/")
+    parts = path.split("/")
+
+    crumbs = []
+
+    for depth in range(1, len(parts)):
+        title = titles.get(f"{base}/cloud/{'/'.join(parts[:depth])}")
+        if title:
+            crumbs.append(title)
+
+    return crumbs
 
 
 # ---------------------------------------------------------
@@ -398,6 +1016,7 @@ def document_id(source_path: Path) -> str:
 def parse_document(
     text: str,
     source_path: Path,
+    page_breadcrumb: list[str] | None = None,
 ) -> dict[str, Any]:
 
     cleaned = clean_gitbook_markdown(text)
@@ -449,6 +1068,7 @@ def parse_document(
                 "document_title": title,
                 "source_file": str(source_path),
                 "source_url": source_url(source_path),
+                "breadcrumb": list(page_breadcrumb or []),
                 "heading": (heading_stack[-1] if heading_stack else title),
                 "heading_path": heading_stack.copy(),
                 "block_types": sorted(set(block_types)),
@@ -570,13 +1190,24 @@ def parse_document(
             "code_block",
         }:
 
-            content = token_to_text(token)
+            # Embedded OpenAPI specs become readable Markdown
+            # (see "OpenAPI specs" above); other code is kept as is.
+            spec = parse_openapi(token.content)
+            heading = heading_stack[-1] if heading_stack else title
+            api_markdown = openapi_to_markdown(spec, heading) if spec else None
+
+            if api_markdown:
+                block_type = "api_spec"
+                content = api_markdown
+            else:
+                block_type = "code"
+                content = token_to_text(token)
 
             if content:
 
                 current_blocks.append(
                     {
-                        "block_type": "code",
+                        "block_type": block_type,
                         "content": content,
                     }
                 )
@@ -632,6 +1263,9 @@ def parse_document(
                 visible,
             ).strip()
 
+            # Entities such as &#x26; or &amp; become "&".
+            visible = unescape(visible)
+
             if visible:
 
                 current_blocks.append(
@@ -678,6 +1312,11 @@ def main():
 
     print(f"Found {len(files)} Markdown files.")
 
+    page_titles = load_page_titles(LLMS_INDEX)
+
+    if not page_titles:
+        print(f"WARNING: {LLMS_INDEX} not found or empty; sections get no breadcrumb.")
+
     total_sections = 0
 
     with OUTPUT_FILE.open(
@@ -694,6 +1333,7 @@ def main():
                 document = parse_document(
                     text,
                     path,
+                    breadcrumb(source_url(path), page_titles),
                 )
 
                 for section in document["sections"]:
