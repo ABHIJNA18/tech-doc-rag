@@ -18,6 +18,10 @@
 #                    run: settings, models, prompt version, checksums of
 #                    the corpus and the golden set, git commit, totals
 #
+# File paths in run_config.json are stored without your home folder
+# (repository files relative, e.g. eval/golden_set.jsonl; other files
+# as ~/...), so committed results do not reveal the local username.
+#
 # The golden set is validated first; the run stops if it has problems.
 #
 # Usage:
@@ -85,6 +89,27 @@ def read_index_manifest() -> dict[str, Any] | None:
         return None
 
     return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+# Removes your Mac's home folder from file paths so saved results don't reveal your username.
+def hide_local_paths(value: Any) -> Any:
+    """
+    Applied to the whole run_config before saving: in every text value,
+    the repository path becomes relative (eval/golden_set.jsonl) and the
+    home folder becomes ~ (~/Projects/ionos-docs/...). Works through
+    nested dicts and lists, e.g. the copied index manifest.
+    """
+
+    if isinstance(value, dict):
+        return {key: hide_local_paths(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [hide_local_paths(item) for item in value]
+
+    if isinstance(value, str):
+        return value.replace(f"{config.REPO_DIR}/", "").replace(str(Path.home()), "~")
+
+    return value
 
 
 def answer_record_from_result(golden_record: dict[str, Any], result: AnswerResult) -> dict[str, Any]:
@@ -180,6 +205,7 @@ def summarize_answer_records(answer_records: list[dict[str, Any]], wall_seconds:
     }
 
 
+# Asks all golden questions, then saves the answers and a record of how the run was done.
 def main():
 
     parser = argparse.ArgumentParser(description="Run the golden set through the RAG pipeline and save the answers")
@@ -297,7 +323,9 @@ def main():
         "totals": totals,
     }
 
-    (run_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (run_dir / "run_config.json").write_text(
+        json.dumps(hide_local_paths(run_config), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
     flush()
 
