@@ -1,0 +1,12 @@
+# Packages for the scoring step of the evaluation (scripts/score_eval.py).
+# Installed in a separate virtual environment, because RAGAS would
+# downgrade langchain-openai and openai in the main one:
+#   python3.14 -m venv .venv-eval
+#   .venv-eval/bin/pip install -r requirements-eval.txt
+ragas==0.4.3
+# RAGAS 0.4.3 imports langchain_community.chat_models.vertexai, which
+# newer langchain-community versions (0.4+) no longer contain.
+langchain-community==0.3.31
+python-dotenv
+# Official Anthropic SDK: the Claude judge (ClaudeJudgeLLM in score_eval.py).
+anthropic==1.12.1

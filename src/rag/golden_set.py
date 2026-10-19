@@ -68,12 +68,14 @@ def evidence_chunk_ids(golden_record: dict[str, Any]) -> set[str]:
     return {chunk_id for item in golden_record["evidence"] for chunk_id in item["chunk_ids"]}
 
 
+# Lists everything wrong with one question of the answer key.
 def find_golden_record_problems(
     golden_record: dict[str, Any], chunks_by_id: dict[str, dict[str, Any]]
 ) -> list[str]:
     """
     Everything wrong with one record, as readable messages (empty list
-    = record is fine).
+    = record is fine). The expected answer must contain every required
+    term, so the answer key itself would pass the required-terms check.
     """
 
     record_id = golden_record.get("id", "<no id>")
@@ -88,6 +90,13 @@ def find_golden_record_problems(
 
     if golden_record["type"] not in QUESTION_TYPES:
         problems.append(f"{record_id}: unknown type {golden_record['type']!r}")
+
+    missing_terms = [
+        term for term in golden_record["required_terms"]
+        if term.lower() not in golden_record["expected_answer"].lower()
+    ]
+    if missing_terms:
+        problems.append(f"{record_id}: expected_answer lacks required terms {missing_terms}")
 
     if not golden_record["question"].strip() or not golden_record["expected_answer"].strip():
         problems.append(f"{record_id}: empty question or expected_answer")
