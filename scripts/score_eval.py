@@ -16,8 +16,9 @@
 # default Claude Sonnet 5.5 through the Anthropic SDK, ClaudeJudgeLLM):
 #   - faithfulness: share of the answer's claims supported by the
 #     retrieved chunks (made-up facts lower it)
-#   - factual correctness (recall mode): share of the golden answer's
-#     facts that the answer contains
+#   - answer recall: share of the golden answer's facts that the answer
+#     contains (AnswerRecall, built from RAGAS's FactualCorrectness
+#     steps; extra correct details do not lower it, see the class)
 #   - context recall: share of the golden answer's facts that the
 #     retrieved chunks contain
 #   - declines: does the answer say the docs do not cover it (good for
@@ -76,6 +77,7 @@ from ragas.llms import llm_factory  # noqa: E402
 from ragas.llms.base import InstructorBaseRagasLLM  # noqa: E402
 from ragas.metrics import DiscreteMetric  # noqa: E402
 from ragas.metrics.collections import ContextRecall, FactualCorrectness, Faithfulness  # noqa: E402
+from ragas.metrics.result import MetricResult  # noqa: E402
 
 CITATION_MARKER_RE = re.compile(r"\[(\d+)\]")
 
@@ -91,7 +93,7 @@ and needs clarification. It still counts as declining if it adds related context
 where the information might be found. Answer "no" if the response presents an answer to the
 question, including an answer based on a guessed interpretation of an unclear question."""
 
-JUDGE_METRIC_NAMES = ("faithfulness", "factual_correctness", "context_recall", "declines")
+JUDGE_METRIC_NAMES = ("faithfulness", "answer_recall", "context_recall", "declines")
 
 
 # ---------------------------------------------------------
@@ -316,6 +318,57 @@ class ClaudeJudgeLLM(InstructorBaseRagasLLM):
         raise NotImplementedError("score_eval.py grades asynchronously; use agenerate()")
 
 
+class AnswerRecall(FactualCorrectness):
+    """
+    Share of the golden answer's facts that the answer contains: the
+    golden answer is split into claims, and each claim is checked
+    against the answer.
+
+    Why not FactualCorrectness(mode="recall"): RAGAS 0.4.3 computes
+    tp / (tp + fn), where tp counts the ANSWER's claims that the golden
+    answer supports. So extra correct details (an auth header, a status
+    code) earn nothing, and an answer that covers every golden fact but
+    adds details can score 0.00 (q35 did). This class keeps only the
+    "golden claims vs answer" half, which is what recall means. Made-up
+    extras are still caught by the faithfulness check.
+
+    Uses the same RAGAS prompts as FactualCorrectness (2 judge calls
+    per question instead of 4), and the reason lists the missing facts.
+    """
+
+    # Splits the golden answer into claims, checks each against the question + answer, and returns the share found.
+    async def ascore(self, question: str, response: str, reference: str) -> MetricResult:
+        """
+        The judge reads the question together with the answer, as a
+        person would: answers rely on the question for their subject
+        ("the valid sizes are XS...XL" answers a question about the
+        Event Streams API). Without it, q21 scored 0.00 for a correct answer.
+        """
+
+        if not question or not response or not reference:
+            raise ValueError("answer recall needs the question, the answer and the golden answer")
+
+        golden_claims = await self._decompose_claims(reference)
+        if not golden_claims:
+            raise ValueError("the judge found no claims in the golden answer")
+
+        question_and_answer = f"Question: {question}\nAnswer: {response}"
+        verdicts = await self._verify_claims(golden_claims, question_and_answer)
+        if len(verdicts.statements) != len(golden_claims):
+            raise ValueError(
+                f"the judge returned {len(verdicts.statements)} verdicts for {len(golden_claims)} golden claims"
+            )
+
+        missing_claims = [item.statement for item in verdicts.statements if not item.verdict]
+        found_count = len(golden_claims) - len(missing_claims)
+        reason = (
+            f"{found_count}/{len(golden_claims)} golden facts found."
+            + (" Missing: " + " | ".join(missing_claims) if missing_claims else "")
+        )
+
+        return MetricResult(value=round(found_count / len(golden_claims), 2), reason=reason)
+
+
 # Sets up the judge LLM (Claude or OpenAI, from config.EVAL_JUDGE_MODEL) and the four RAGAS checks.
 def make_judge_metrics(usage_counter: JudgeUsageCounter) -> tuple[Any, dict[str, Any]]:
     """
@@ -342,7 +395,7 @@ def make_judge_metrics(usage_counter: JudgeUsageCounter) -> tuple[Any, dict[str,
 
     judge_metrics = {
         "faithfulness": Faithfulness(llm=judge_llm),
-        "factual_correctness": FactualCorrectness(llm=judge_llm, mode="recall"),
+        "answer_recall": AnswerRecall(llm=judge_llm),
         "context_recall": ContextRecall(llm=judge_llm),
         "declines": DiscreteMetric(name="declines", allowed_values=["yes", "no"], prompt=DECLINES_PROMPT),
     }
@@ -366,7 +419,7 @@ async def judge_checks_for_questions(
 ) -> dict[str, dict[str, Any]]:
     """
     scoring_items: (golden record, answer record, retrieved chunk texts).
-    Correctness and context recall need a golden answer, so they only
+    Answer recall and context recall need a golden answer, so they only
     run for answerable questions. A failed judge call is recorded as an
     error for that check; the other checks still run.
     """
@@ -400,8 +453,8 @@ async def judge_checks_for_questions(
         if golden_record["answerable"]:
             reference = golden_record["expected_answer"]
 
-            tasks.append(run_one_check(question_id, "factual_correctness", lambda a=answer, r=reference:
-                judge_metrics["factual_correctness"].ascore(response=a, reference=r)))
+            tasks.append(run_one_check(question_id, "answer_recall", lambda q=question, a=answer, r=reference:
+                judge_metrics["answer_recall"].ascore(question=q, response=a, reference=r)))
 
             tasks.append(run_one_check(question_id, "context_recall", lambda q=question, t=retrieved_texts, r=reference:
                 judge_metrics["context_recall"].ascore(user_input=q, retrieved_contexts=t, reference=r)))
@@ -480,7 +533,7 @@ def summarize_score_records(score_records: list[dict[str, Any]]) -> dict[str, An
             "cites_evidence_chunk": rate_or_none([record["code"]["cites_evidence_chunk"] for record in answerable]),
             "invalid_citation_answers": sum(1 for record in graded if record["code"]["invalid_citation_numbers"]),
             "faithfulness": mean_or_none([judge_value(record, "faithfulness") for record in answerable]),
-            "factual_correctness": mean_or_none([judge_value(record, "factual_correctness") for record in answerable]),
+            "answer_recall": mean_or_none([judge_value(record, "answer_recall") for record in answerable]),
             "context_recall": mean_or_none([judge_value(record, "context_recall") for record in answerable]),
             "refusal_accuracy": rate_or_none([declined(record) for record in unanswerable]),
             "false_refusal_rate": rate_or_none([declined(record) for record in answerable]),
@@ -512,9 +565,9 @@ def find_failures(score_records: list[dict[str, Any]]) -> list[str]:
                 problems.append(f"evidence {code['evidence_items_found']}/{code['evidence_items_total']}")
             if judge.get("declines", {}).get("value") == "yes":
                 problems.append("false refusal")
-            correctness = judge.get("factual_correctness", {}).get("value")
-            if correctness is not None and correctness < 1:
-                problems.append(f"correctness {correctness:.2f}")
+            answer_recall = judge.get("answer_recall", {}).get("value")
+            if answer_recall is not None and answer_recall < 1:
+                problems.append(f"answer recall {answer_recall:.2f}")
         elif judge.get("declines", {}).get("value") == "no":
             problems.append("answered instead of declining")
 
@@ -556,7 +609,7 @@ def summary_markdown(run_name: str, summary: dict[str, Any], failures: list[str]
         ("Evidence recall", overall["retrieval"]["evidence_recall"], False),
         ("All evidence found (multi-fact questions)", overall["retrieval"]["all_evidence_found_multi"], True),
         ("Faithfulness (RAGAS)", overall["answer"]["faithfulness"], False),
-        ("Factual correctness, recall (RAGAS)", overall["answer"]["factual_correctness"], False),
+        ("Answer recall (golden facts found)", overall["answer"]["answer_recall"], False),
         ("Context recall (RAGAS)", overall["answer"]["context_recall"], False),
         ("Required terms present", overall["answer"]["required_terms_ok"], True),
         ("Cites an evidence chunk", overall["answer"]["cites_evidence_chunk"], True),
@@ -591,7 +644,7 @@ def summary_markdown(run_name: str, summary: dict[str, Any], failures: list[str]
         "",
         "## By question type",
         "",
-        "| Type | n | hit@1 | hit@5 | MRR | Faithfulness | Correctness | Declined |",
+        "| Type | n | hit@1 | hit@5 | MRR | Faithfulness | Answer recall | Declined |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
 
@@ -602,7 +655,7 @@ def summary_markdown(run_name: str, summary: dict[str, Any], failures: list[str]
         lines.append(
             f"| {question_type} | {type_summary['graded']} | {format_score(retrieval['hit_at_1'], True)} | "
             f"{format_score(retrieval['hit_at_5'], True)} | {format_score(retrieval['mrr'], False)} | "
-            f"{format_score(answer['faithfulness'], False)} | {format_score(answer['factual_correctness'], False)} | "
+            f"{format_score(answer['faithfulness'], False)} | {format_score(answer['answer_recall'], False)} | "
             f"{format_score(declined_rate, True)} |"
         )
 
