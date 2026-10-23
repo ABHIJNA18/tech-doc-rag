@@ -37,7 +37,8 @@
 #
 # A run can be re-graded after the answer key (expected answers, notes)
 # was improved, as long as its questions are unchanged; summary.json
-# records which answer key version did the grading.
+# records which answer key version and which grader version (the last
+# git commit of each, "-dirty" if uncommitted changes) did the grading.
 #
 # Usage:
 #   .venv-eval/bin/python scripts/score_eval.py phase1_vector_v1_run1
@@ -95,6 +96,14 @@ question, including an answer based on a guessed interpretation of an unclear qu
 
 JUDGE_METRIC_NAMES = ("faithfulness", "answer_recall", "context_recall", "declines")
 
+# How answer recall splits a golden answer into claims (RAGAS settings).
+# "high" atomicity: one fact per claim, so missing one detail loses only
+# that fact (with "low", q43's four steps were one claim and scored 0.00).
+# "high" coverage: every fact is kept (with "low", RAGAS's own example
+# drops details, so those facts were never checked).
+ANSWER_RECALL_ATOMICITY = "high"
+ANSWER_RECALL_COVERAGE = "high"
+
 
 # ---------------------------------------------------------
 # Loading
@@ -106,8 +115,8 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-# Finds the last git commit that changed the answer key, to record which version graded a run.
-def golden_set_last_commit(golden_set_file: Path) -> str:
+# Finds the last git commit that changed a file (the answer key or this grader), to record which versions graded a run.
+def file_last_commit(tracked_file: Path) -> str:
     """
     The short hash of the last commit touching the file, plus "-dirty"
     when the file has uncommitted changes ("unknown" without git).
@@ -122,8 +131,8 @@ def golden_set_last_commit(golden_set_file: Path) -> str:
         ).stdout.strip()
 
     try:
-        commit = git("log", "-1", "--format=%h", "--", str(golden_set_file))
-        dirty = bool(git("status", "--porcelain", "--", str(golden_set_file)))
+        commit = git("log", "-1", "--format=%h", "--", str(tracked_file))
+        dirty = bool(git("status", "--porcelain", "--", str(tracked_file)))
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
 
@@ -334,6 +343,8 @@ class AnswerRecall(FactualCorrectness):
 
     Uses the same RAGAS prompts as FactualCorrectness (2 judge calls
     per question instead of 4), and the reason lists the missing facts.
+    The claim-splitting settings are ANSWER_RECALL_ATOMICITY and
+    ANSWER_RECALL_COVERAGE (both "high": one fact per claim, none dropped).
     """
 
     # Splits the golden answer into claims, checks each against the question + answer, and returns the share found.
@@ -395,7 +406,9 @@ def make_judge_metrics(usage_counter: JudgeUsageCounter) -> tuple[Any, dict[str,
 
     judge_metrics = {
         "faithfulness": Faithfulness(llm=judge_llm),
-        "answer_recall": AnswerRecall(llm=judge_llm),
+        "answer_recall": AnswerRecall(
+            llm=judge_llm, atomicity=ANSWER_RECALL_ATOMICITY, coverage=ANSWER_RECALL_COVERAGE
+        ),
         "context_recall": ContextRecall(llm=judge_llm),
         "declines": DiscreteMetric(name="declines", allowed_values=["yes", "no"], prompt=DECLINES_PROMPT),
     }
@@ -764,8 +777,12 @@ def main():
         "golden_set": {
             "file": run_config["golden_set"]["file"],
             "sha256": golden_set_sha256,
-            "last_commit": golden_set_last_commit(golden_set_file),
+            "last_commit": file_last_commit(golden_set_file),
             "same_as_run": golden_set_sha256 == run_config["golden_set"]["sha256"],
+        },
+        "grader": {
+            "file": "scripts/score_eval.py",
+            "last_commit": file_last_commit(Path(__file__).resolve()),
         },
         "overall": summarize_score_records(score_records),
         "by_type": {
@@ -776,6 +793,10 @@ def main():
         "judge": {
             "model": None if args.no_judge else config.EVAL_JUDGE_MODEL,
             "effort": config.EVAL_JUDGE_EFFORT if config.EVAL_JUDGE_MODEL.startswith("claude-") else None,
+            "answer_recall_claims": None if args.no_judge else {
+                "atomicity": ANSWER_RECALL_ATOMICITY,
+                "coverage": ANSWER_RECALL_COVERAGE,
+            },
             "ragas_version": None if args.no_judge else ragas.__version__,
             "calls": usage_counter.calls,
             "calls_per_model": dict(usage_counter.calls_per_model),
