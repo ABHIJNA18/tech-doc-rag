@@ -11,6 +11,9 @@
 #   3. build_citations(): map each cited [n] back to its chunk (URL,
 #      breadcrumb, section, exact text) for display
 #
+# The token usage and estimated cost of the LLM call are returned too
+# (rag/llm_costs.py), so the evaluation can report cost per answer.
+#
 # The LLM decides which sources it used; our code turns the numbers
 # into real sources. Checking that citations are honest is phase 2
 # (citation enforcement).
@@ -27,6 +30,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from rag import config
+from rag.llm_costs import estimate_llm_cost_usd, llm_token_usage
 from rag.prompts import load_prompt_template
 from rag.retrieval import RetrievedChunk
 from rag.tracing import langchain_callbacks, observe
@@ -67,17 +71,22 @@ class GeneratedAnswer:
     model: str
     prompt_version: str
     cited_numbers_from_llm: list[int] = field(default_factory=list)
+    token_usage: dict[str, int] = field(default_factory=dict)
+    cost_usd: float | None = None
 
 
 @lru_cache(maxsize=None)
 def get_answer_llm() -> Any:
     """
     The chat model, set up once, constrained to return LLMCitedAnswer.
+    include_raw=True also returns the raw model message, which carries
+    the token usage: {"raw": message, "parsed": LLMCitedAnswer,
+    "parsing_error": ...}.
     """
 
     llm = ChatOpenAI(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
 
-    return llm.with_structured_output(LLMCitedAnswer)
+    return llm.with_structured_output(LLMCitedAnswer, include_raw=True)
 
 
 def format_sources_for_prompt(retrieved_chunks: list[RetrievedChunk]) -> str:
@@ -154,10 +163,17 @@ def generate_cited_answer(
         {"sources": format_sources_for_prompt(retrieved_chunks), "question": question}
     )
 
-    llm_output: LLMCitedAnswer = get_answer_llm().invoke(
+    llm_response = get_answer_llm().invoke(
         prompt_messages,
         config={"callbacks": langchain_callbacks(), "run_name": "llm_answer"},
     )
+
+    llm_output: LLMCitedAnswer | None = llm_response["parsed"]
+
+    if llm_output is None:
+        raise ValueError(f"The LLM response did not match LLMCitedAnswer: {llm_response['parsing_error']}")
+
+    token_usage = llm_token_usage(llm_response["raw"])
 
     return GeneratedAnswer(
         answer=llm_output.answer,
@@ -165,4 +181,6 @@ def generate_cited_answer(
         model=config.LLM_MODEL,
         prompt_version=prompt_version,
         cited_numbers_from_llm=llm_output.cited_sources,
+        token_usage=token_usage,
+        cost_usd=estimate_llm_cost_usd(config.LLM_MODEL, token_usage),
     )

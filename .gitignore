@@ -11,3 +11,6 @@ data/
 
 #script which contains llm txt links
 scripts/llms.txt
+
+# separate virtual environment for RAGAS scoring (see requirements-eval.txt)
+.venv-eval/

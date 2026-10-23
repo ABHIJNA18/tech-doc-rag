@@ -8,15 +8,16 @@
 #     └─ generate_cited_answer()  LLM answer citing those chunks
 #
 # Every entry point uses this one function: the command line
-# (scripts/ask_cli.py), the web API (api/main.py) and later the
-# evaluation. Each call is one Langfuse trace, tagged with where it
-# came from (source="cli", "api", "eval").
+# (scripts/ask_cli.py), the web API (api/main.py) and the evaluation
+# (scripts/run_eval.py). Each call is one Langfuse trace, tagged with
+# where it came from (source="cli", "api", "eval"). The result also
+# carries the LLM token usage and estimated cost.
 # ---------------------------------------------------------
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from rag import config
@@ -43,6 +44,9 @@ class AnswerResult:
     prompt_version: str
     latency_seconds: float
     trace_id: str | None
+    cited_numbers_from_llm: list[int] = field(default_factory=list)
+    llm_token_usage: dict[str, int] = field(default_factory=dict)
+    llm_cost_usd: float | None = None
 
     def to_api_response(self) -> dict[str, Any]:
         """
@@ -93,6 +97,9 @@ def run_rag_pipeline(question: str, top_k: int, retrieval_mode: str, prompt_vers
         prompt_version=generated.prompt_version,
         latency_seconds=time.perf_counter() - started,
         trace_id=current_trace_id(),
+        cited_numbers_from_llm=generated.cited_numbers_from_llm,
+        llm_token_usage=generated.token_usage,
+        llm_cost_usd=generated.cost_usd,
     )
 
     update_current_span(
@@ -115,13 +122,16 @@ def answer_question(
     retrieval_mode: str | None = None,
     prompt_version: str | None = None,
     source: str = "cli",
+    trace_session_id: str | None = None,
 ) -> AnswerResult:
     """
     Answer one question with citations. `source` labels the trace with
-    the caller ("cli", "api", "eval").
+    the caller ("cli", "api", "eval"). `trace_session_id` groups traces
+    in Langfuse (the evaluation passes its run name, so all answers of
+    one run appear together under Sessions).
     """
 
-    with trace_attributes(trace_name="answer_question", tags=[source]):
+    with trace_attributes(trace_name="answer_question", tags=[source], session_id=trace_session_id):
         return run_rag_pipeline(
             question,
             top_k or config.TOP_K,

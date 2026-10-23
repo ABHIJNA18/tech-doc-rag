@@ -1,8 +1,8 @@
 # ---------------------------------------------------------
 # config.py
 #
-# Central settings for the RAG system: data locations, model names
-# and the Chroma collection name.
+# Central settings for the RAG system: data locations, model names,
+# the Chroma collection name, LLM prices and evaluation paths.
 #
 # Every value has a local default and can be overridden with an
 # environment variable (e.g. in .env, or on a server when deployed),
@@ -71,6 +71,37 @@ LLM_TEMPERATURE = float(os.environ.get("RAG_LLM_TEMPERATURE", "0"))
 # Versioned prompts live in the repository (configs/prompts.yaml).
 PROMPTS_FILE = _path("RAG_PROMPTS_FILE", REPO_DIR / "configs" / "prompts.yaml")
 PROMPT_VERSION = os.environ.get("RAG_PROMPT_VERSION", "v1")
+
+# OpenAI prices in USD per 1 million tokens, used to estimate the cost
+# of each answer (prices as of 2026-10-07; check
+# https://developers.openai.com/api/docs/pricing when they change).
+# Models missing here get no cost estimate.
+LLM_PRICES_USD_PER_1M_TOKENS = {
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    # Anthropic prices (as of 2026-10-09; https://platform.claude.com/docs
+    # pricing). Claude Sonnet 5 is the server-side fallback for the judge.
+    "claude-sonnet-5-5": {"input": 2.00, "cached_input": 0.20, "output": 10.00},
+    "claude-sonnet-5": {"input": 2.00, "cached_input": 0.20, "output": 10.00},
+}
+
+
+# ---------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------
+
+# The golden evaluation set (in the repository) and the folder where
+# each evaluation run writes its results.
+GOLDEN_SET_FILE = _path("RAG_GOLDEN_SET_FILE", REPO_DIR / "eval" / "golden_set.jsonl")
+EVAL_RESULTS_DIR = _path("RAG_EVAL_RESULTS_DIR", REPO_DIR / "eval" / "results")
+
+# The LLM that grades answers in scripts/score_eval.py (RAGAS judge): a
+# stronger model than the one that writes the answers (LLM_MODEL), from
+# a different provider, so the judge does not favour its own model
+# family. Claude needs ANTHROPIC_API_KEY in .env. The effort level
+# (Claude only) keeps its thinking short for simple grading decisions.
+EVAL_JUDGE_MODEL = os.environ.get("RAG_EVAL_JUDGE_MODEL", "claude-sonnet-5-5")
+EVAL_JUDGE_EFFORT = os.environ.get("RAG_EVAL_JUDGE_EFFORT", "low")
 
 
 # ---------------------------------------------------------
